@@ -1,0 +1,86 @@
+name: Build TWRP 3.2.3 (Shedaim tree)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [android17-layout]
+    paths: [".github/workflows/build-twrp-323.yml"]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          sudo apt-get clean
+          df -h /
+
+      - name: Write build script
+        run: |
+          mkdir -p ~/work
+          cat > ~/work/build.sh <<'EOF'
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y openjdk-8-jdk git curl ca-certificates python python3 bc bison flex \
+            g++-multilib gcc-multilib gperf libxml2-utils zip unzip lzop zlib1g-dev lib32z1-dev \
+            libncurses5-dev lib32ncurses5-dev xz-utils lzma rsync libssl-dev xxd cpio file perl
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
+          chmod +x /usr/local/bin/repo
+          git config --global user.name builder
+          git config --global user.email builder@localhost
+          git config --global color.ui false
+
+          mkdir -p /work/twrp && cd /work/twrp
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git -b twrp-7.1
+          repo sync -c -j8 --force-sync --no-clone-bundle --no-tags \
+            || repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+
+          git clone --depth 1 https://github.com/Shedaim/gtactive2lte.git device/samsung/gtactive2lte
+          git clone --depth 1 https://github.com/Shedaim/kernel_samsung_gtactive2lte.git kernel/samsung/gtactive2lte
+
+          export LC_ALL=C USER=builder
+          export ALLOW_MISSING_DEPENDENCIES=true
+          set +u
+          source build/envsetup.sh
+          lunch omni_gtactive2lte-eng
+          make -j$(nproc) recoveryimage
+
+          mkdir -p /work/release
+          cp out/target/product/gtactive2lte/recovery.img /work/release/
+          cd /work/release
+          printf 'SEANDROIDENFORCE' >> recovery.img
+          tar -H ustar -cf recovery.tar recovery.img
+          cp recovery.tar recovery.tar.md5
+          md5sum -t recovery.tar >> recovery.tar.md5
+          # ramdisk size check for the ~8 MB sboot limit
+          python3 - <<'PY' > info.txt
+          import struct
+          d=open('recovery.img','rb').read(4096)
+          k,ka,r=struct.unpack('<III',d[8:20])
+          print('kernel_size',k,'ramdisk_size',r)
+          PY
+          cat info.txt
+          sha256sum recovery.img recovery.tar > SHA256SUMS
+          ls -la
+          EOF
+          chmod +x ~/work/build.sh
+
+      - name: Build in Ubuntu 18.04 container
+        run: |
+          sudo docker run --rm -v ~/work:/work ubuntu:18.04 /work/build.sh
+
+      - name: Upload recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-3.2.3-gtactive2lte
+          path: |
+            ~/work/release/recovery.img
+            ~/work/release/recovery.tar
+            ~/work/release/recovery.tar.md5
+            ~/work/release/info.txt
+            ~/work/release/SHA256SUMS
