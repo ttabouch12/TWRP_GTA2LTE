@@ -1,0 +1,104 @@
+name: Build TWRP (gtactive2lte)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [android17-layout]
+    paths: [".github/workflows/build-twrp.yml"]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf lib32ncurses5-dev lib32z1-dev libncurses5 libncurses5-dev libssl-dev \
+            libxml2-utils lzop python-is-python3 rsync unzip zip zlib1g-dev locales xxd
+          sudo locale-gen en_US.UTF-8
+          mkdir -p ~/bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod +x ~/bin/repo
+          git config --global user.name "builder"
+          git config --global user.email "builder@localhost"
+          git config --global color.ui false
+
+      - name: Sync minimal TWRP 9.0 source
+        run: |
+          mkdir -p ~/twrp && cd ~/twrp
+          ~/bin/repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git -b twrp-9.0
+          ~/bin/repo sync -c -j8 --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune \
+            || ~/bin/repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+          df -h /
+
+      - name: Add device tree
+        uses: actions/checkout@v4
+        with:
+          path: device-tree
+
+      - name: Place device tree and apply patches
+        run: |
+          cd ~/twrp
+          mkdir -p device/samsung
+          rm -rf device/samsung/gtactive2lte
+          cp -r "$GITHUB_WORKSPACE/device-tree" device/samsung/gtactive2lte
+          rm -rf device/samsung/gtactive2lte/.git device/samsung/gtactive2lte/.github
+          for p in device/samsung/gtactive2lte/patches/*.patch; do
+            name=$(basename "$p" .patch)
+            dir=${name/_//}            # build_make -> build/make, system_core -> system/core
+            echo ">> $p -> $dir"
+            git -C "$dir" apply --whitespace=nowarn "$PWD/$p"
+          done
+
+      - name: Build recovery image
+        run: |
+          cd ~/twrp
+          export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+          export ALLOW_MISSING_DEPENDENCIES=true
+          set +u
+          source build/envsetup.sh
+          lunch omni_gtactive2lte-userdebug
+          mka -j$(nproc) recoveryimage
+
+      - name: Package for Odin
+        run: |
+          cd ~/twrp/out/target/product/gtactive2lte
+          printf 'SEANDROIDENFORCE' >> recovery.img
+          mkdir -p ~/release && cp recovery.img ~/release/
+          cd ~/release
+          tar -H ustar -cf recovery.tar recovery.img
+          cp recovery.tar recovery.tar.md5
+          md5sum -t recovery.tar >> recovery.tar.md5
+          sha256sum recovery.img recovery.tar > SHA256SUMS
+          ls -la
+
+      - name: Upload recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-gtactive2lte
+          path: |
+            ~/release/recovery.img
+            ~/release/recovery.tar
+            ~/release/recovery.tar.md5
+            ~/release/SHA256SUMS
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ~/twrp/out/error.log
+            ~/twrp/out/verbose.log.gz
+            ~/twrp/out/soong.log
+          if-no-files-found: ignore
